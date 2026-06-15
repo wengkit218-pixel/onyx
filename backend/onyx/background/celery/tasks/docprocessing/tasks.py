@@ -1471,6 +1471,7 @@ def docprocessing_task(
     tenant_id: str,
     batch_num: int,
     enqueue_time_ms: int | None = None,
+    source_index_attempt_id: int | None = None,
 ) -> None:
     """Process a batch of documents through the indexing pipeline.
 
@@ -1481,6 +1482,13 @@ def docprocessing_task(
     docfetching enqueued this task. Used to compute the QUEUE_WAIT stage
     metric. Optional + defaults to None so in-flight tasks queued by an older
     docfetching deployment continue to work across rolling deploys.
+
+    ``source_index_attempt_id`` names the attempt whose namespace holds the
+    batch file, for batches re-issued from a prior attempt on checkpoint resume
+    (the batch is read in place rather than copied into this attempt). None for
+    batches this attempt fetched itself. Also tolerant of rolling deploys: an
+    older worker that lacks this param simply won't receive it, and the leftover
+    batch is re-issued again on the next resume.
     """
     # Start heartbeat for this indexing attempt
     heartbeat_thread, stop_event = start_heartbeat(index_attempt_id)
@@ -1488,7 +1496,12 @@ def docprocessing_task(
         # Cannot use the TaskSingleton approach here because the worker is multithreaded
         token = INDEX_ATTEMPT_INFO_CONTEXTVAR.set((cc_pair_id, index_attempt_id))
         _docprocessing_task(
-            index_attempt_id, cc_pair_id, tenant_id, batch_num, enqueue_time_ms
+            index_attempt_id,
+            cc_pair_id,
+            tenant_id,
+            batch_num,
+            enqueue_time_ms,
+            source_index_attempt_id,
         )
     finally:
         stop_heartbeat(heartbeat_thread, stop_event)  # Stop heartbeat before exiting
@@ -1620,6 +1633,7 @@ def _docprocessing_task(
     tenant_id: str,
     batch_num: int,
     enqueue_time_ms: int | None = None,
+    source_index_attempt_id: int | None = None,
 ) -> None:
     start_time = time.monotonic()
 
@@ -1669,8 +1683,15 @@ def _docprocessing_task(
         f"Processing document batch: attempt={index_attempt_id} batch_num={batch_num} "
     )
 
-    # Get the document batch storage
-    storage = get_document_batch_storage(cc_pair_id, index_attempt_id)
+    # Get the document batch storage. Re-issued leftover batches live under the
+    # attempt that wrote them, so read/delete them from there; freshly fetched
+    # batches (source_index_attempt_id is None) live under this attempt.
+    batch_owner_attempt_id = (
+        source_index_attempt_id
+        if source_index_attempt_id is not None
+        else index_attempt_id
+    )
+    storage = get_document_batch_storage(cc_pair_id, batch_owner_attempt_id)
 
     redis_connector = RedisConnector(tenant_id, cc_pair_id)
     r = get_redis_client(tenant_id=tenant_id)

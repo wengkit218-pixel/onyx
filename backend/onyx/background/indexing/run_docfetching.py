@@ -991,16 +991,15 @@ def reissue_old_batches(
     most_recent_attempt: IndexAttempt | None,
     priority: OnyxCeleryPriority,
 ) -> tuple[int, int]:
-    # When loading from a checkpoint, we need to start new docprocessing tasks
-    # tied to the new index attempt for any batches left over in the file store
+    # When loading from a checkpoint, re-issue docprocessing tasks for any
+    # batches left over in the file store. The batches stay where the attempt
+    # that wrote them put them; each task carries the batch's source attempt id
+    # so docprocessing reads it in place. We deliberately do NOT copy every
+    # leftover file into this attempt's namespace — on large piles that was
+    # tens of thousands of serial S3 copies, long enough that the DB connection
+    # dropped mid-resume and the attempt failed before indexing anything.
     old_batches = batch_storage.get_all_batches_for_cc_pair()
-    batch_storage.update_old_batches_to_new_index_attempt(old_batches)
     for batch_id in old_batches:
-        logger.info(
-            "Re-issuing docprocessing task for batch %s for index attempt %s",
-            batch_id,
-            index_attempt_id,
-        )
         path_info = batch_storage.extract_path_info(batch_id)
         if path_info is None:
             logger.warning(
@@ -1028,6 +1027,9 @@ def reissue_old_batches(
                 "cc_pair_id": cc_pair_id,
                 "tenant_id": tenant_id,
                 "batch_num": path_info.batch_num,  # use same batch num as previously
+                # The batch lives under the attempt that wrote it, not this one;
+                # docprocessing reads it from there.
+                "source_index_attempt_id": path_info.index_attempt_id,
                 # Use current time (not the original send time) so QUEUE_WAIT
                 # measures wait time for *this* reissue, not stale latency from
                 # the prior attempt.
@@ -1042,9 +1044,10 @@ def reissue_old_batches(
     # is still in the filestore waiting for processing or not.
     last_batch_num = len(old_batches) + recent_batches
     logger.info(
-        "Starting from batch %s due to re-issued batches: %s, completed batches: %s",
+        "Re-issued %s leftover batch(es); resuming new fetches at batch %s "
+        "(completed batches: %s)",
+        len(old_batches),
         last_batch_num,
-        old_batches,
         recent_batches,
     )
     return len(old_batches), recent_batches
