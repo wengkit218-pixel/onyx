@@ -1,0 +1,130 @@
+name: Opal Upgrade
+
+# Dispatched by `ods upgrade opal`. Runs as the Onyx release bot (the same
+# GitHub App used by the cherry-pick automation) to bump the @onyx-ai/opal
+# version and open a PR. Merging that PR triggers tag-opal-on-merge.yml, which
+# pushes the opal/vX.Y.Z tag and fires release-opal.yml to publish to npm.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver part to bump (ignored when version is set)"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      version:
+        description: "Exact version X.Y.Z, no leading v (overrides bump)"
+        type: string
+        required: false
+        default: ""
+      reviewer:
+        description: "GitHub login to request as PR reviewer"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  open-upgrade-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Mint GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.CHERRY_PICK_APP_ID }}
+          private-key: ${{ secrets.CHERRY_PICK_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git identity as App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          bot_user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # ratchet:oven-sh/setup-bun@v2 # zizmor: ignore[cache-poisoning]
+        with:
+          bun-version: "1.3.13"
+
+      - name: Compute and write new version
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+          VERSION_INPUT: ${{ inputs.version }}
+        working-directory: web/lib/opal
+        run: |
+          if [ -n "${VERSION_INPUT}" ] && ! echo "${VERSION_INPUT}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version input must be X.Y.Z with no leading v, got '${VERSION_INPUT}'"
+            exit 1
+          fi
+          CUR="$(node -p "require('./package.json').version")"
+          if [ -n "${VERSION_INPUT}" ]; then
+            NEW="${VERSION_INPUT}"
+          else
+            NEW="$(node -e "const v=require('./package.json').version.split('.').map(Number);const b=process.env.BUMP;let r;if(b==='major')r=[v[0]+1,0,0];else if(b==='minor')r=[v[0],v[1]+1,0];else r=[v[0],v[1],v[2]+1];console.log(r.join('.'))")"
+          fi
+          if [ "${NEW}" = "${CUR}" ]; then
+            echo "::error::new version ${NEW} equals current ${CUR}; nothing to release"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/opal/v${NEW}" >/dev/null 2>&1; then
+            echo "::error::tag opal/v${NEW} already exists"
+            exit 1
+          fi
+          npm version "${NEW}" --no-git-tag-version
+          echo "new_version=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "Bumped opal ${CUR} -> ${NEW}"
+
+      - name: Refresh workspace lockfile
+        working-directory: web
+        run: bun install
+
+      - name: Open release PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          REVIEWER: ${{ inputs.reviewer }}
+        run: |
+          BRANCH="opal-release/v${NEW_VERSION}"
+          git switch -c "${BRANCH}"
+          git add web/lib/opal/package.json web/bun.lock
+          git commit -m "chore(opal): release v${NEW_VERSION}"
+          git push origin "${BRANCH}"
+
+          body="$(cat <<EOF
+          Automated \`@onyx-ai/opal\` release, dispatched via \`ods upgrade opal\`.
+
+          - Bumps \`web/lib/opal/package.json\` to **v${NEW_VERSION}** and refreshes \`web/bun.lock\`.
+          - On merge, \`tag-opal-on-merge.yml\` pushes the \`opal/v${NEW_VERSION}\` tag, which builds and publishes the package to npm via \`release-opal.yml\`.
+
+          - [x] Override Linear Check
+          EOF
+          )"
+
+          pr_args=(--base main --head "${BRANCH}" --title "chore(opal): release v${NEW_VERSION}" --body "${body}")
+          if [ -n "${REVIEWER}" ]; then
+            pr_args+=(--reviewer "${REVIEWER}")
+          fi
+          pr_url="$(gh pr create "${pr_args[@]}")"
+          echo "Opened ${pr_url}"
+          echo "### Opal release PR (v${NEW_VERSION}): ${pr_url}" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,65 @@
+name: Tag Opal On Merge
+
+# Closes the opal release loop. When an `opal-release/*` PR (opened by
+# opal-upgrade.yml) merges into main, push the opal/vX.Y.Z tag matching the
+# merged package.json version. The tag is pushed with a GitHub App token, not
+# the default GITHUB_TOKEN, so it triggers release-opal.yml (events created by
+# GITHUB_TOKEN cannot trigger further workflows).
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: read
+
+jobs:
+  push-opal-tag:
+    # Restrict to merged, internal opal-release/* PRs into main. The branch
+    # prefix is only ever produced by opal-upgrade.yml's bot.
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == 'main'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.event.pull_request.head.ref, 'opal-release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mint GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.CHERRY_PICK_APP_ID }}
+          private-key: ${{ secrets.CHERRY_PICK_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Checkout merge commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git identity as App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          bot_user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Push opal release tag
+        run: |
+          VERSION="$(node -p "require('./web/lib/opal/package.json').version")"
+          TAG="opal/v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin; nothing to do."
+            exit 0
+          fi
+          echo "Creating and pushing ${TAG}"
+          git tag "${TAG}"
+          git push origin "${TAG}"
+          echo "### Pushed ${TAG} → release-opal.yml will publish to npm" >> "$GITHUB_STEP_SUMMARY"
